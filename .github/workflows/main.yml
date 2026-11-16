@@ -435,4 +435,126 @@ jobs:
               return TRUE;
           }
           NFSU2_CPP_EOF
-          cat > plugin/CMakeLis
+          cat > plugin/CMakeLists.txt <<'NFSU2_CMAKE_EOF'
+          cmake_minimum_required(VERSION 3.24)
+          project(nfsu2_voice LANGUAGES C CXX)
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          # Runtime estático (MSVC): o .asi não depende de DLLs do Visual C++
+          set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+          # O Opus declara um cmake_minimum_required antigo, o que o faria ignorar
+          # CMAKE_MSVC_RUNTIME_LIBRARY e usar o runtime dinâmico (/MD), em conflito com o /MT
+          # do plugin (erro LNK2019 em __except_handler4_common). Esta linha corrige isso.
+          set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
+
+          if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+              set(CMAKE_BUILD_TYPE Release)
+          endif()
+
+          include(FetchContent)
+
+          # --- Opus (codec de voz) ---
+          # Se existir deps/opus-1.5.2.tar.gz ao lado deste arquivo, usa o arquivo local
+          # (útil quando não há internet no ambiente de compilação, ex.: Winlator).
+          set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+          set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+          set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+          set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+          set(OPUS_STACK_PROTECTOR OFF CACHE BOOL "" FORCE)
+          set(OPUS_FORTIFY_SOURCE OFF CACHE BOOL "" FORCE)
+
+          set(OPUS_LOCAL ${CMAKE_SOURCE_DIR}/deps/opus-1.5.2.tar.gz)
+          if(EXISTS ${OPUS_LOCAL})
+              set(OPUS_SRC ${OPUS_LOCAL})
+          else()
+              set(OPUS_SRC https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz)
+          endif()
+          FetchContent_Declare(opus URL ${OPUS_SRC} DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+          FetchContent_MakeAvailable(opus)
+          set_target_properties(opus PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+          # --- miniaudio (captura/reprodução, header único) ---
+          # Também aceita deps/miniaudio.h local.
+          set(MA_DIR ${CMAKE_BINARY_DIR}/miniaudio)
+          if(EXISTS ${CMAKE_SOURCE_DIR}/deps/miniaudio.h)
+              file(COPY ${CMAKE_SOURCE_DIR}/deps/miniaudio.h DESTINATION ${MA_DIR})
+          elseif(NOT EXISTS ${MA_DIR}/miniaudio.h)
+              file(DOWNLOAD
+                  https://raw.githubusercontent.com/mackron/miniaudio/0.11.21/miniaudio.h
+                  ${MA_DIR}/miniaudio.h
+                  STATUS ma_status
+                  SHOW_PROGRESS)
+              list(GET ma_status 0 ma_code)
+              if(NOT ma_code EQUAL 0)
+                  file(REMOVE ${MA_DIR}/miniaudio.h)
+                  message(FATAL_ERROR "Falha ao baixar miniaudio.h. Baixe manualmente e coloque em plugin/deps/miniaudio.h")
+              endif()
+          endif()
+
+          add_library(nfsu2_voice SHARED src/nfsu2_voice.cpp)
+          target_include_directories(nfsu2_voice PRIVATE ${MA_DIR})
+          target_compile_definitions(nfsu2_voice PRIVATE _CRT_SECURE_NO_WARNINGS _WIN32_WINNT=0x0601)
+          target_link_libraries(nfsu2_voice PRIVATE opus ws2_32)
+
+          # MinGW (gcc): liga tudo de forma estática, sem depender de DLLs do compilador
+          if(MINGW)
+              target_link_options(nfsu2_voice PRIVATE -static -static-libgcc -static-libstdc++)
+          endif()
+
+          # Saída: nfsu2_voice.asi
+          set_target_properties(nfsu2_voice PROPERTIES PREFIX "" OUTPUT_NAME "nfsu2_voice" SUFFIX ".asi")
+
+          # Copia o .ini de exemplo ao lado do .asi
+          add_custom_command(TARGET nfsu2_voice POST_BUILD
+              COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                      ${CMAKE_SOURCE_DIR}/nfsu2_voice.ini $<TARGET_FILE_DIR:nfsu2_voice>/nfsu2_voice.ini)
+          NFSU2_CMAKE_EOF
+          cat > plugin/nfsu2_voice.ini <<'NFSU2_INI_EOF'
+          [voice]
+          ; Endereço (IP ou domínio) e porta UDP do servidor de voz
+          server=127.0.0.1
+          port=27500
+
+          ; Código da sala. Todos que usarem o MESMO código se ouvem.
+          ; Use algo difícil de adivinhar: ele funciona como senha da sala.
+          room=minha-sala-nfsu2
+
+          ; Tecla de falar (push-to-talk), código virtual-key do Windows.
+          ; 0x78 = F9 | 0x56 = V | 0x14 = CapsLock | 0x12 = Alt
+          ; Lista completa: https://learn.microsoft.com/windows/win32/inputdev/virtual-key-codes
+          ptt_key=0x78
+
+          ; 1 = microfone sempre aberto (ignora a tecla). 0 = push-to-talk.
+          always_on=0
+
+          ; 1 = a tecla só funciona com a janela do jogo em foco.
+          only_when_focused=1
+
+          ; Ganho do microfone e do volume das vozes recebidas (1.0 = normal)
+          mic_gain=1.0
+          output_gain=1.0
+
+          ; Taxa de bits do Opus em bps (8000 a 64000). 24000 é boa para voz.
+          bitrate=24000
+          NFSU2_INI_EOF
+
+      - name: Configurar (x86 / 32 bits)
+        run: cmake -S plugin -B build -A Win32
+
+      - name: Compilar
+        run: cmake --build build --config Release
+
+      - name: Conferir resultado
+        shell: bash
+        run: ls -l build/Release
+
+      - name: Enviar nfsu2_voice.asi
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfsu2_voice
+          path: |
+            build/Release/nfsu2_voice.asi
+            build/Release/nfsu2_voice.ini
