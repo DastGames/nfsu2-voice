@@ -1,0 +1,527 @@
+# Compila o nfsu2_voice.asi (Windows, 32 bits) na nuvem do GitHub.
+# Este arquivo ja contem o codigo-fonte inteiro: basta colocá-lo em
+#   .github/workflows/build.yml   de um repositorio seu e clicar em "Run workflow".
+name: Build nfsu2_voice.asi
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Criar arquivos do projeto
+        shell: bash
+        run: |
+          mkdir -p plugin/src
+          cat > plugin/src/nfsu2_voice.cpp <<'NFSU2_CPP_EOF'
+          // nfsu2_voice.cpp - Chat de voz push-to-talk para Need for Speed: Underground 2 (PC, x86)
+          //
+          // Funcionamento:
+          //   - O plugin é carregado pelo ASI Loader dentro do processo do jogo.
+          //   - Uma thread própria abre o microfone e a saída de áudio via miniaudio
+          //     (dispositivos independentes: não mexe no áudio do jogo).
+          //   - Enquanto a tecla de falar está pressionada, o áudio é codificado em Opus
+          //     (48 kHz, mono, frames de 20 ms) e enviado por UDP ao servidor de retransmissão.
+          //   - Os pacotes recebidos dos outros jogadores da mesma sala são decodificados,
+          //     passam por um pequeno jitter buffer e são mixados na saída.
+          //
+          // Protocolo: veja server/voice_server.py (cabeçalho fixo de 14 bytes).
+
+          #define WIN32_LEAN_AND_MEAN
+          #define NOMINMAX
+          #include <winsock2.h>
+          #include <ws2tcpip.h>
+          #include <windows.h>
+
+          #include <atomic>
+          #include <cstdarg>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <string>
+
+          #define MA_NO_DECODING
+          #define MA_NO_ENCODING
+          #define MA_NO_GENERATION
+          #define MA_NO_ENGINE
+          #define MINIAUDIO_IMPLEMENTATION
+          #include "miniaudio.h"
+
+          #include <opus.h>
+
+          // ------------------------------------------------------------------ constantes
+          static const int      SAMPLE_RATE   = 48000;
+          static const int      FRAME         = 960;      // 20 ms @ 48 kHz
+          static const int      MAX_PACKET    = 1400;
+          static const int      HDR_SIZE      = 14;
+          static const int      MAX_SPEAKERS  = 16;
+          static const int      MAX_BUFFERED  = FRAME * 8;   // ~160 ms: acima disso descarta frame novo
+          static const int      PREBUFFER     = FRAME * 3;   // ~60 ms antes de começar a tocar
+          static const uint8_t  PKT_VERSION   = 1;
+          enum : uint8_t { PKT_JOIN = 1, PKT_VOICE = 2, PKT_LEAVE = 3 };
+
+          // ------------------------------------------------------------------ configuração
+          struct Config {
+              std::string server = "127.0.0.1";
+              int         port = 27500;
+              std::string room = "nfsu2";
+              int         pttKey = 0x78;        // F9
+              bool        alwaysOn = false;     // microfone aberto (sem push-to-talk)
+              bool        onlyFocused = true;   // PTT só vale com a janela do jogo em foco
+              float       micGain = 1.0f;
+              float       outGain = 1.0f;
+              int         bitrate = 24000;
+          };
+
+          static Config            g_cfg;
+          static std::atomic<bool> g_stop{false};
+          static FILE*             g_log = nullptr;
+          static std::string       g_dir;
+          static uint32_t          g_room = 0;
+          static uint32_t          g_id = 0;
+
+          // ------------------------------------------------------------------ utilidades
+          static void LogF(const char* fmt, ...) {
+              if (!g_log) return;
+              va_list ap;
+              va_start(ap, fmt);
+              vfprintf(g_log, fmt, ap);
+              va_end(ap);
+              fputc('\n', g_log);
+              fflush(g_log);
+          }
+
+          static std::string ModuleDir() {
+              HMODULE h = nullptr;
+              GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 reinterpret_cast<LPCSTR>(&ModuleDir), &h);
+              char buf[MAX_PATH] = {0};
+              GetModuleFileNameA(h, buf, MAX_PATH);
+              std::string p(buf);
+              size_t pos = p.find_last_of("\\/");
+              return pos == std::string::npos ? std::string() : p.substr(0, pos + 1);
+          }
+
+          static uint32_t Fnv1a(const std::string& s) {
+              uint32_t h = 2166136261u;
+              for (unsigned char c : s) { h ^= c; h *= 16777619u; }
+              return h;
+          }
+
+          static void LoadConfig() {
+              std::string ini = g_dir + "nfsu2_voice.ini";
+              char buf[256];
+              auto str = [&](const char* key, const char* def) {
+                  GetPrivateProfileStringA("voice", key, def, buf, sizeof(buf), ini.c_str());
+                  return std::string(buf);
+              };
+              g_cfg.server      = str("server", g_cfg.server.c_str());
+              g_cfg.port        = atoi(str("port", "27500").c_str());
+              g_cfg.room        = str("room", g_cfg.room.c_str());
+              g_cfg.pttKey      = (int)strtol(str("ptt_key", "0x78").c_str(), nullptr, 0);
+              g_cfg.alwaysOn    = atoi(str("always_on", "0").c_str()) != 0;
+              g_cfg.onlyFocused = atoi(str("only_when_focused", "1").c_str()) != 0;
+              g_cfg.micGain     = (float)atof(str("mic_gain", "1.0").c_str());
+              g_cfg.outGain     = (float)atof(str("output_gain", "1.0").c_str());
+              g_cfg.bitrate     = atoi(str("bitrate", "24000").c_str());
+              if (g_cfg.bitrate < 8000)  g_cfg.bitrate = 8000;
+              if (g_cfg.bitrate > 64000) g_cfg.bitrate = 64000;
+          }
+
+          static bool PttActive() {
+              if (g_cfg.alwaysOn) return true;
+              if (!(GetAsyncKeyState(g_cfg.pttKey) & 0x8000)) return false;
+              if (g_cfg.onlyFocused) {
+                  DWORD pid = 0;
+                  GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+                  if (pid != GetCurrentProcessId()) return false;
+              }
+              return true;
+          }
+
+          static void PutHeader(uint8_t* p, uint8_t type, uint16_t seq) {
+              p[0] = 'N'; p[1] = 'V'; p[2] = PKT_VERSION; p[3] = type;
+              memcpy(p + 4, &g_room, 4);
+              memcpy(p + 8, &g_id, 4);
+              memcpy(p + 12, &seq, 2);
+          }
+
+          // ------------------------------------------------------------------ áudio
+          static ma_pcm_rb g_cap;                 // microfone -> thread de rede
+
+          struct Speaker {
+              std::atomic<bool> active{false};
+              std::atomic<bool> playing{false};
+              uint32_t          id = 0;
+              OpusDecoder*      dec = nullptr;
+              ma_pcm_rb         rb;
+              uint16_t          lastSeq = 0;
+              uint64_t          lastRx = 0;
+          };
+          static Speaker g_spk[MAX_SPEAKERS];
+
+          static void CaptureCallback(ma_device*, void*, const void* in, ma_uint32 frames) {
+              const int16_t* src = static_cast<const int16_t*>(in);
+              while (frames > 0) {
+                  ma_uint32 n = frames;
+                  void* dst = nullptr;
+                  if (ma_pcm_rb_acquire_write(&g_cap, &n, &dst) != MA_SUCCESS || n == 0) break;  // cheio: descarta
+                  memcpy(dst, src, n * sizeof(int16_t));
+                  ma_pcm_rb_commit_write(&g_cap, n);
+                  src += n;
+                  frames -= n;
+              }
+          }
+
+          static void PlaybackCallback(ma_device*, void* out, const void*, ma_uint32 frames) {
+              int16_t* o = static_cast<int16_t*>(out);
+              ma_uint32 done = 0;
+              while (done < frames) {
+                  ma_uint32 chunk = frames - done;
+                  if (chunk > 1024) chunk = 1024;
+                  int32_t mix[1024];
+                  memset(mix, 0, chunk * sizeof(int32_t));
+
+                  for (int i = 0; i < MAX_SPEAKERS; ++i) {
+                      Speaker& s = g_spk[i];
+                      if (!s.active.load()) continue;
+                      ma_uint32 avail = ma_pcm_rb_available_read(&s.rb);
+                      if (!s.playing.load()) {
+                          if (avail < (ma_uint32)PREBUFFER) continue;
+                          s.playing.store(true);
+                      }
+                      if (avail == 0) { s.playing.store(false); continue; }
+
+                      ma_uint32 want = chunk, off = 0;
+                      while (want > 0) {
+                          ma_uint32 n = want;
+                          void* p = nullptr;
+                          if (ma_pcm_rb_acquire_read(&s.rb, &n, &p) != MA_SUCCESS || n == 0) break;
+                          const int16_t* sp = static_cast<const int16_t*>(p);
+                          for (ma_uint32 k = 0; k < n; ++k) mix[off + k] += sp[k];
+                          ma_pcm_rb_commit_read(&s.rb, n);
+                          off += n;
+                          want -= n;
+                      }
+                  }
+
+                  for (ma_uint32 k = 0; k < chunk; ++k) {
+                      int32_t v = (int32_t)(mix[k] * g_cfg.outGain);
+                      if (v > 32767) v = 32767;
+                      if (v < -32768) v = -32768;
+                      o[done + k] = (int16_t)v;
+                  }
+                  done += chunk;
+              }
+          }
+
+          // ------------------------------------------------------------------ recepção
+          static Speaker* FindOrCreateSpeaker(uint32_t id, uint64_t now) {
+              Speaker* freeSlot = nullptr;
+              for (int i = 0; i < MAX_SPEAKERS; ++i) {
+                  Speaker& s = g_spk[i];
+                  if (s.active.load() && s.id == id) return &s;
+                  if (!s.active.load() && !freeSlot) freeSlot = &s;
+              }
+              if (!freeSlot) return nullptr;
+              int err = 0;
+              freeSlot->dec = opus_decoder_create(SAMPLE_RATE, 1, &err);
+              if (err != OPUS_OK || !freeSlot->dec) { freeSlot->dec = nullptr; return nullptr; }
+              ma_pcm_rb_reset(&freeSlot->rb);
+              freeSlot->id = id;
+              freeSlot->lastSeq = 0;
+              freeSlot->lastRx = now;
+              freeSlot->playing.store(false);
+              freeSlot->active.store(true);
+              LogF("Falante %08x entrou", id);
+              return freeSlot;
+          }
+
+          static void PushDecoded(Speaker& s, const int16_t* pcm) {
+              if (ma_pcm_rb_available_read(&s.rb) > (ma_uint32)MAX_BUFFERED) return;  // atrasado demais: descarta
+              ma_uint32 left = FRAME;
+              const int16_t* src = pcm;
+              while (left > 0) {
+                  ma_uint32 n = left;
+                  void* dst = nullptr;
+                  if (ma_pcm_rb_acquire_write(&s.rb, &n, &dst) != MA_SUCCESS || n == 0) break;
+                  memcpy(dst, src, n * sizeof(int16_t));
+                  ma_pcm_rb_commit_write(&s.rb, n);
+                  src += n;
+                  left -= n;
+              }
+          }
+
+          static void HandlePacket(const uint8_t* d, int len, uint64_t now) {
+              if (len <= HDR_SIZE || d[0] != 'N' || d[1] != 'V' || d[2] != PKT_VERSION || d[3] != PKT_VOICE) return;
+              uint32_t room, sender;
+              uint16_t seq;
+              memcpy(&room, d + 4, 4);
+              memcpy(&sender, d + 8, 4);
+              memcpy(&seq, d + 12, 2);
+              if (room != g_room || sender == g_id) return;
+
+              Speaker* s = FindOrCreateSpeaker(sender, now);
+              if (!s) return;
+              s->lastRx = now;
+
+              int16_t pcm[FRAME];
+              if (s->lastSeq != 0 || s->playing.load()) {
+                  int16_t diff = (int16_t)(seq - s->lastSeq);
+                  if (diff <= 0) return;                         // duplicado ou fora de ordem
+                  if (diff > 1 && diff <= 3) {                   // perda curta: PLC do Opus
+                      for (int i = 1; i < diff; ++i)
+                          if (opus_decode(s->dec, nullptr, 0, pcm, FRAME, 0) == FRAME) PushDecoded(*s, pcm);
+                  }
+              }
+              s->lastSeq = seq;
+              if (opus_decode(s->dec, d + HDR_SIZE, len - HDR_SIZE, pcm, FRAME, 0) == FRAME) PushDecoded(*s, pcm);
+          }
+
+          static void ExpireSpeakers(uint64_t now) {
+              for (int i = 0; i < MAX_SPEAKERS; ++i) {
+                  Speaker& s = g_spk[i];
+                  if (s.active.load() && now - s.lastRx > 10000) {
+                      s.active.store(false);
+                      if (s.dec) { opus_decoder_destroy(s.dec); s.dec = nullptr; }
+                      LogF("Falante %08x saiu (timeout)", s.id);
+                  }
+              }
+          }
+
+          // ------------------------------------------------------------------ thread principal
+          static DWORD WINAPI VoiceThread(LPVOID) {
+              Sleep(3000);  // deixa o jogo terminar de inicializar
+
+              g_dir = ModuleDir();
+              g_log = fopen((g_dir + "nfsu2_voice.log").c_str(), "w");
+              LoadConfig();
+              g_room = Fnv1a(g_cfg.room);
+              LARGE_INTEGER qpc;
+              QueryPerformanceCounter(&qpc);
+              g_id = (uint32_t)(qpc.QuadPart ^ (GetTickCount64() * 2654435761u) ^ (GetCurrentProcessId() << 8));
+              if (g_id == 0) g_id = 1;
+              LogF("nfsu2_voice iniciado: servidor=%s:%d sala='%s' (%08x) id=%08x ptt=0x%02x",
+                   g_cfg.server.c_str(), g_cfg.port, g_cfg.room.c_str(), g_room, g_id, g_cfg.pttKey);
+
+              // --- rede
+              WSADATA wsa;
+              if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { LogF("WSAStartup falhou"); return 1; }
+
+              addrinfo hints = {}, *res = nullptr;
+              hints.ai_family = AF_INET;
+              hints.ai_socktype = SOCK_DGRAM;
+              char portStr[16];
+              snprintf(portStr, sizeof(portStr), "%d", g_cfg.port);
+              if (getaddrinfo(g_cfg.server.c_str(), portStr, &hints, &res) != 0 || !res) {
+                  LogF("Nao foi possivel resolver '%s'", g_cfg.server.c_str());
+                  return 1;
+              }
+              SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+              if (sock == INVALID_SOCKET || connect(sock, res->ai_addr, (int)res->ai_addrlen) != 0) {
+                  LogF("Falha ao criar/conectar socket UDP (erro %d)", WSAGetLastError());
+                  freeaddrinfo(res);
+                  return 1;
+              }
+              freeaddrinfo(res);
+              u_long nb = 1;
+              ioctlsocket(sock, FIONBIO, &nb);
+
+              // --- opus
+              int err = 0;
+              OpusEncoder* enc = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, &err);
+              if (err != OPUS_OK || !enc) { LogF("opus_encoder_create falhou (%d)", err); return 1; }
+              opus_encoder_ctl(enc, OPUS_SET_BITRATE(g_cfg.bitrate));
+              opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(5));
+              opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
+              opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(5));
+              opus_encoder_ctl(enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+
+              // --- buffers e dispositivos
+              ma_pcm_rb_init(ma_format_s16, 1, SAMPLE_RATE, nullptr, nullptr, &g_cap);       // 1 s
+              for (int i = 0; i < MAX_SPEAKERS; ++i)
+                  ma_pcm_rb_init(ma_format_s16, 1, SAMPLE_RATE / 2, nullptr, nullptr, &g_spk[i].rb);  // 0,5 s
+
+              ma_device capDev, outDev;
+              ma_device_config cc = ma_device_config_init(ma_device_type_capture);
+              cc.capture.format = ma_format_s16;
+              cc.capture.channels = 1;
+              cc.sampleRate = SAMPLE_RATE;
+              cc.periodSizeInFrames = FRAME;
+              cc.dataCallback = CaptureCallback;
+              if (ma_device_init(nullptr, &cc, &capDev) != MA_SUCCESS) { LogF("Falha ao abrir microfone"); return 1; }
+
+              ma_device_config pc = ma_device_config_init(ma_device_type_playback);
+              pc.playback.format = ma_format_s16;
+              pc.playback.channels = 1;
+              pc.sampleRate = SAMPLE_RATE;
+              pc.periodSizeInFrames = FRAME;
+              pc.dataCallback = PlaybackCallback;
+              if (ma_device_init(nullptr, &pc, &outDev) != MA_SUCCESS) { LogF("Falha ao abrir saida de audio"); return 1; }
+
+              ma_device_start(&capDev);
+              ma_device_start(&outDev);
+              LogF("Audio iniciado. Microfone: %s | Saida: %s", capDev.capture.name, outDev.playback.name);
+
+              // --- loop
+              uint8_t  pkt[MAX_PACKET];
+              uint8_t  rx[MAX_PACKET];
+              int16_t  pcm[FRAME];
+              uint16_t seq = 0;
+              uint64_t lastJoin = 0, lastExpire = 0;
+
+              while (!g_stop.load()) {
+                  uint64_t now = GetTickCount64();
+
+                  if (now - lastJoin > 3000) {   // JOIN também serve de keepalive
+                      PutHeader(pkt, PKT_JOIN, 0);
+                      send(sock, (const char*)pkt, HDR_SIZE, 0);
+                      lastJoin = now;
+                  }
+
+                  for (;;) {                      // recebe tudo que estiver pendente
+                      int n = recv(sock, (char*)rx, sizeof(rx), 0);
+                      if (n <= 0) break;
+                      HandlePacket(rx, n, now);
+                  }
+
+                  bool talk = PttActive();
+                  while (ma_pcm_rb_available_read(&g_cap) >= (ma_uint32)FRAME) {
+                      ma_uint32 got = 0;
+                      while (got < (ma_uint32)FRAME) {
+                          ma_uint32 n = FRAME - got;
+                          void* p = nullptr;
+                          if (ma_pcm_rb_acquire_read(&g_cap, &n, &p) != MA_SUCCESS || n == 0) break;
+                          memcpy(pcm + got, p, n * sizeof(int16_t));
+                          ma_pcm_rb_commit_read(&g_cap, n);
+                          got += n;
+                      }
+                      if (got < (ma_uint32)FRAME) break;
+                      if (!talk) continue;        // consome e descarta quando não está falando
+
+                      if (g_cfg.micGain != 1.0f) {
+                          for (int i = 0; i < FRAME; ++i) {
+                              int32_t v = (int32_t)(pcm[i] * g_cfg.micGain);
+                              pcm[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+                          }
+                      }
+                      int len = opus_encode(enc, pcm, FRAME, pkt + HDR_SIZE, MAX_PACKET - HDR_SIZE);
+                      if (len > 0) {
+                          PutHeader(pkt, PKT_VOICE, seq++);
+                          send(sock, (const char*)pkt, HDR_SIZE + len, 0);
+                      }
+                  }
+
+                  if (now - lastExpire > 2000) { ExpireSpeakers(now); lastExpire = now; }
+                  Sleep(5);
+              }
+
+              PutHeader(pkt, PKT_LEAVE, 0);
+              send(sock, (const char*)pkt, HDR_SIZE, 0);
+              return 0;
+          }
+
+          BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
+              if (reason == DLL_PROCESS_ATTACH) {
+                  DisableThreadLibraryCalls(hMod);
+                  HANDLE h = CreateThread(nullptr, 0, VoiceThread, nullptr, 0, nullptr);
+                  if (h) CloseHandle(h);
+              } else if (reason == DLL_PROCESS_DETACH) {
+                  g_stop.store(true);   // o processo está encerrando; o SO libera o resto
+              }
+              return TRUE;
+          }
+          NFSU2_CPP_EOF
+          cat > plugin/CMakeLists.txt <<'NFSU2_CMAKE_EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(nfsu2_voice LANGUAGES C CXX)
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          # Runtime estático: o .asi não depende de DLLs do Visual C++ na máquina do jogador
+          set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+          include(FetchContent)
+
+          # --- Opus (codec de voz) ---
+          set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+          set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+          set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+          set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+          FetchContent_Declare(opus
+              GIT_REPOSITORY https://github.com/xiph/opus.git
+              GIT_TAG        v1.5.2)
+          FetchContent_MakeAvailable(opus)
+
+          # --- miniaudio (captura/reprodução, header único) ---
+          set(MA_DIR ${CMAKE_BINARY_DIR}/miniaudio)
+          if(NOT EXISTS ${MA_DIR}/miniaudio.h)
+              file(DOWNLOAD
+                  https://raw.githubusercontent.com/mackron/miniaudio/0.11.21/miniaudio.h
+                  ${MA_DIR}/miniaudio.h
+                  SHOW_PROGRESS)
+          endif()
+
+          add_library(nfsu2_voice SHARED src/nfsu2_voice.cpp)
+          target_include_directories(nfsu2_voice PRIVATE ${MA_DIR})
+          target_compile_definitions(nfsu2_voice PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
+          target_link_libraries(nfsu2_voice PRIVATE opus ws2_32)
+
+          # Saída: nfsu2_voice.asi
+          set_target_properties(nfsu2_voice PROPERTIES PREFIX "" OUTPUT_NAME "nfsu2_voice" SUFFIX ".asi")
+
+          # Copia o .ini de exemplo ao lado do .asi
+          add_custom_command(TARGET nfsu2_voice POST_BUILD
+              COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                      ${CMAKE_SOURCE_DIR}/nfsu2_voice.ini $<TARGET_FILE_DIR:nfsu2_voice>/nfsu2_voice.ini)
+          NFSU2_CMAKE_EOF
+          cat > plugin/nfsu2_voice.ini <<'NFSU2_INI_EOF'
+          [voice]
+          ; Endereço (IP ou domínio) e porta UDP do servidor de voz
+          server=127.0.0.1
+          port=27500
+
+          ; Código da sala. Todos que usarem o MESMO código se ouvem.
+          ; Use algo difícil de adivinhar: ele funciona como senha da sala.
+          room=minha-sala-nfsu2
+
+          ; Tecla de falar (push-to-talk), código virtual-key do Windows.
+          ; 0x78 = F9 | 0x56 = V | 0x14 = CapsLock | 0x12 = Alt
+          ; Lista completa: https://learn.microsoft.com/windows/win32/inputdev/virtual-key-codes
+          ptt_key=0x78
+
+          ; 1 = microfone sempre aberto (ignora a tecla). 0 = push-to-talk.
+          always_on=0
+
+          ; 1 = a tecla só funciona com a janela do jogo em foco.
+          only_when_focused=1
+
+          ; Ganho do microfone e do volume das vozes recebidas (1.0 = normal)
+          mic_gain=1.0
+          output_gain=1.0
+
+          ; Taxa de bits do Opus em bps (8000 a 64000). 24000 é boa para voz.
+          bitrate=24000
+          NFSU2_INI_EOF
+
+      - name: Configurar (x86 / 32 bits)
+        run: cmake -S plugin -B build -A Win32
+
+      - name: Compilar
+        run: cmake --build build --config Release
+
+      - name: Conferir resultado
+        shell: bash
+        run: ls -l build/Release
+
+      - name: Enviar nfsu2_voice.asi
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfsu2_voice
+          path: |
+            build/Release/nfsu2_voice.asi
+            build/Release/nfsu2_voice.ini
